@@ -2,7 +2,7 @@ name: Daily Nehru Place Scraper
 
 on:
   schedule:
-    - cron: '0 0 * * *' # Midnight UTC
+    - cron: '0 0 * * *'
   workflow_dispatch:
 
 permissions:
@@ -19,7 +19,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          # Removed cache: 'pip' to prevent requirements.txt dependency errors
 
       - name: Install dependencies
         run: |
@@ -36,7 +35,6 @@ jobs:
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
 
-          # Stage only the single output CSV file
           git add data/nehru_place_prices.csv
 
           if ! git diff-index --quiet HEAD; then
