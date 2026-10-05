@@ -10,6 +10,8 @@ import os
 import re
 import sys
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin
@@ -20,10 +22,11 @@ from bs4 import BeautifulSoup
 # --- Configuration ---
 INDEX_URL = "https://www.nehruplacemarket.com/price-list.html"
 OUTPUT_FILE = Path("data/nehru_place_prices.csv")
-REQUEST_DELAY = 1.0  # Politeness delay between page requests (seconds)
-REQUEST_TIMEOUT = 30  # Socket timeout (seconds)
+REQUEST_DELAY = 0.5  # Politeness delay between paginated requests
+REQUEST_TIMEOUT = 30 
 MAX_RETRIES = 3
-USER_AGENT = "nehru-place-price-scraper/2.0 (open-data dump; github-actions)"
+MAX_WORKERS = 10 # Number of concurrent categories to scrape
+USER_AGENT = "nehru-place-price-scraper/3.0 (open-data dump; github-actions)"
 
 FIELDS = [
     "category",
@@ -39,23 +42,14 @@ FIELDS = [
 
 # Slugs (from index page URLs) targeted for PC builds
 PC_PARTS_SLUGS = {
-    "cpu-price-list",
-    "motherboard-price-list",
-    "ram-price-list",
-    "graphicscard-price-list",
-    "harddisk-price-list",
-    "cabinet-price-list",
-    "monitor-price-list",
-    "led-lcd-price-list",
-    "keyboard-mouse-price-list",
-    "ups-invertor-price-list",
-    "cpu-fan-price",
-    "dvdwriter-price-list",
-    "networking-price-list",
-    "multimedia-price-list",
+    "cpu-price-list", "motherboard-price-list", "ram-price-list",
+    "graphicscard-price-list", "harddisk-price-list", "cabinet-price-list",
+    "monitor-price-list", "led-lcd-price-list", "keyboard-mouse-price-list",
+    "ups-invertor-price-list", "cpu-fan-price", "dvdwriter-price-list",
+    "networking-price-list", "multimedia-price-list",
 }
 
-# --- Logging Setup ---
+# --- Logging & Metrics Setup ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -63,33 +57,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger("nehru_scraper")
 
-session = requests.Session()
-session.headers.update({"User-Agent": USER_AGENT})
-
-UPDATED_RE = re.compile(
-    r"Last Updated on:\s*(\w+ \d{1,2}, \d{4})\s*-\s*(\d{1,2}:\d{2}\s*[ap]m)",
-    re.IGNORECASE,
-)
-
-
 class ScrapeMetrics:
     def __init__(self):
         self.start_time = time.time()
         self.total_requests = 0
         self.retry_count = 0
         self.failed_requests = 0
-        self.total_items_parsed = 0
         self.anomalies_missing_price = 0
-        self.categories_processed = 0
-        self.categories_failed = 0
-        self.category_breakdown = {}  # {category: {'rows': int, 'pages': int, 'status': str}}
+        self.category_breakdown = {}
 
     def finish(self):
         self.duration_seconds = round(time.time() - self.start_time, 2)
 
-
 metrics = ScrapeMetrics()
 
+# Thread-safe session with connection pooling
+session = requests.Session()
+session.headers.update({"User-Agent": USER_AGENT})
+adapter = requests.adapters.HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+
+UPDATED_RE = re.compile(
+    r"Last Updated on:\s*(\w+ \d{1,2}, \d{4})\s*-\s*(\d{1,2}:\d{2}\s*[ap]m)",
+    re.IGNORECASE,
+)
+
+# --- Network & Utility Methods ---
 
 def safe_request(url: str, retries: int = MAX_RETRIES) -> BeautifulSoup | None:
     """Fetch HTML with retry backoff and error tracking."""
@@ -101,32 +95,21 @@ def safe_request(url: str, retries: int = MAX_RETRIES) -> BeautifulSoup | None:
             return BeautifulSoup(resp.text, "html.parser")
         except requests.RequestException as exc:
             metrics.retry_count += 1
-            logger.warning(
-                "Request failed (attempt %d/%d) for URL '%s': %s",
-                attempt,
-                retries,
-                url,
-                exc,
-            )
             if attempt < retries:
                 time.sleep(attempt * 2)
             else:
                 metrics.failed_requests += 1
-                logger.error("Exhausted retries. Could not fetch URL: %s", url)
+                logger.error("Exhausted retries for URL: %s", url)
     return None
-
 
 def clean_text(text: str) -> str:
     """Normalize internal spacing and clean NBSP characters."""
     return re.sub(r"\s+", " ", text).strip()
 
-
 def slug_from_url(url: str) -> str:
     return url.rstrip("/").split("/")[-1].replace(".html", "")
 
-
 def parse_timestamp(header_text: str) -> str:
-    """Convert 'Last Updated on: October 5, 2026 - 6:04 pm' to ISO format 'YYYY-MM-DD HH:MM'."""
     match = UPDATED_RE.search(header_text)
     if not match:
         return ""
@@ -136,22 +119,16 @@ def parse_timestamp(header_text: str) -> str:
     except ValueError:
         return normalized
 
+# --- Parsing Methods ---
 
 def extract_category_links(scrape_all: bool) -> dict[str, tuple[str, str]]:
-    """Crawl the main landing page table to find category URLs."""
     logger.info("Accessing root catalogue page: %s", INDEX_URL)
     soup = safe_request(INDEX_URL)
     if not soup:
-        logger.critical("Fatal: Landing index page unreachable.")
-        sys.exit(1)
+        sys.exit("Fatal: Landing index page unreachable.")
 
     categories = {}
-    anchor_tags = soup.select("table a[href]")
-    if not anchor_tags:
-        logger.error("Site structure alert: No category hyperlinks found inside table.")
-        return categories
-
-    for a in anchor_tags:
+    for a in soup.select("table a[href]"):
         href = a.get("href", "").strip()
         label = clean_text(a.get_text())
         if not href:
@@ -161,22 +138,10 @@ def extract_category_links(scrape_all: bool) -> dict[str, tuple[str, str]]:
         slug = slug_from_url(full_url)
 
         if full_url.endswith(".php") and not scrape_all:
-            continue  # Non-standard page template
+            continue
         if scrape_all or slug in PC_PARTS_SLUGS:
             categories[slug] = (label, full_url)
-
-    logger.info("Identified %d categories to scrape.", len(categories))
     return categories
-
-
-def find_price_tables(soup: BeautifulSoup) -> list:
-    """Find all table elements containing standard 'Unit Price' headers."""
-    return [
-        table
-        for table in soup.find_all("table")
-        if table.find(string=re.compile(r"Unit Price", re.IGNORECASE))
-    ]
-
 
 def parse_table_title(table) -> str:
     first_tr = table.find("tr")
@@ -186,92 +151,84 @@ def parse_table_title(table) -> str:
     text = re.split(r"Last Updated on:|\s-\s*Page \d+ of|\s<<", text)[0]
     return re.sub(r"^Page \d+\s*-\s*", "", text).strip(" -")
 
-
 def is_ditto_reference(seller_cell: str) -> bool:
     clean = re.sub(r"[\W_]+", "", seller_cell.lower())
     return clean in ("", "do", "ditto")
 
-
 def parse_rows_from_table(table) -> list[dict]:
-    """Parse rows from price tables, handling ditto sellers and phone separation."""
+    """Adaptive parser handling 2-col, 4-col, and 5-col table structures."""
     rows = []
     last_known_seller = ""
+    
+    header_text = clean_text(table.find("tr").get_text(" ")).lower() if table.find("tr") else ""
+    has_seller_col = "seller" in header_text or "offered by" in header_text
 
     for tr in table.find_all("tr"):
-        cells = [clean_text(td.get_text(" ")) for td in tr.find_all("td")]
-        if len(cells) < 5 or not re.fullmatch(r"\d+\.?", cells[0]):
-            continue  # Header, banner, or pagination row
+        cells = [clean_text(td.get_text(" ")) for td in tr.find_all(["td", "th"])]
+        if len(cells) < 2:
+            continue
 
-        _, model, specs, price_raw, seller_raw = cells[:5]
-        specs = re.sub(r"\s*More info(?:…|\.\.\.)?\s*$", "", specs, flags=re.I)
+        model = specs = price_raw = seller_raw = ""
 
-        # Resolve ditto notation
+        # S.N-led Tables (Standard 4 or 5 columns)
+        if re.fullmatch(r"\d+\.?", cells[0]):
+            if len(cells) >= 5:
+                model, specs, price_raw, seller_raw = cells[1], cells[2], cells[3], cells[4]
+            elif len(cells) == 4:
+                if has_seller_col: # Networking (Model, Price, Seller)
+                    model, specs, price_raw, seller_raw = cells[1], "", cells[2], cells[3]
+                else: # KB/Mouse, Fans (Brand, Model/Specs, Price)
+                    model, specs, price_raw, seller_raw = cells[1], cells[2], cells[3], ""
+            elif len(cells) == 3:
+                model, specs, price_raw = cells[1], "", cells[2]
+                
+        # 2-Column Tables (DVD Writers)
+        elif len(cells) == 2 and re.search(r"\d{3,}", cells[1]):
+            if "price" in cells[1].lower(): 
+                continue
+            model, price_raw = cells[0], cells[1]
+        else:
+            continue
+
+        # Extract only digits for price
+        digits_only = re.sub(r"[^\d]", "", price_raw)
+        if not digits_only and "call" not in price_raw.lower():
+            continue
+
+        # Resolve seller ditto marks
         if is_ditto_reference(seller_raw):
             seller_raw = last_known_seller
         last_known_seller = seller_raw
 
-        # Separate seller name and phone
         phone_match = re.match(r"^(.*?)\s*(\d{7,12})$", seller_raw)
         if phone_match:
             seller_name, seller_phone = phone_match.group(1).strip(), phone_match.group(2)
         else:
             seller_name, seller_phone = seller_raw, ""
 
-        # Price sanitization
-        digits_only = re.sub(r"[^\d]", "", price_raw)
-        if digits_only:
-            unit_price = int(digits_only)
-        else:
-            unit_price = ""
-            metrics.anomalies_missing_price += 1
-
-        rows.append(
-            {
-                "model": model,
-                "specifications": specs,
-                "price_inr": unit_price,
-                "seller_name": seller_name,
-                "seller_phone": seller_phone,
-            }
-        )
-
+        rows.append({
+            "model": model, "specifications": specs,
+            "price_inr": int(digits_only) if digits_only else "",
+            "seller_name": seller_name, "seller_phone": seller_phone,
+        })
     return rows
 
+def parse_text_lists(soup: BeautifulSoup) -> list[dict]:
+    """Fallback parser for unstructured bullet-point layouts (CRT Monitors)."""
+    rows = []
+    for container in soup.find_all(["p", "b", "div"]):
+        for line in container.get_text("\n").split("\n"):
+            line = clean_text(line)
+            # Matches formats like: • Samsung 732n 17″ – 3150/-
+            match = re.search(r"^[•\u2022\-\*]\s*(.*?)\s*(?:–|-)\s*(\d{3,})(?:/-)?$", line)
+            if match:
+                rows.append({
+                    "model": match.group(1).strip(), "specifications": "",
+                    "price_inr": int(match.group(2)), "seller_name": "", "seller_phone": ""
+                })
+    return rows
 
-def separate_page_tables(soup: BeautifulSoup):
-    """Separate the primary paginated table, standalone tables, and sub-list teasers."""
-    tables = find_price_tables(soup)
-    if not tables:
-        return None, [], {}
-
-    # Main table carries the 'Last Updated on' header
-    main_table = next(
-        (t for t in tables if UPDATED_RE.search(clean_text(t.get_text(" ")))), None
-    )
-    if main_table is None and tables:
-        main_table = tables[0]
-
-    standalone_tables = []
-    teaser_urls = {}
-
-    for t in tables:
-        if t is main_table:
-            continue
-        teaser_anchor = t.find("a", string=re.compile(r"View full", re.IGNORECASE))
-        if teaser_anchor:
-            label = re.sub(
-                r"(?i)^view full\s*|\s*price list\s*$",
-                "",
-                teaser_anchor.get_text(strip=True),
-            )
-            teaser_urls[urljoin(INDEX_URL, teaser_anchor["href"])] = label
-        else:
-            standalone_tables.append(t)
-
-    return main_table, standalone_tables, teaser_urls
-
-
-def scrape_category(category_name: str, category_url: str):
+def scrape_category_worker(category_name: str, category_url: str):
     """Crawl a single hardware category through all pages."""
     category_rows = []
     page = 1
@@ -280,115 +237,89 @@ def scrape_category(category_name: str, category_url: str):
     is_success = True
 
     while page <= total_pages:
-        page_url = f"{category_url}?pagenum={page}"
-        soup = safe_request(page_url)
+        soup = safe_request(f"{category_url}?pagenum={page}")
         if soup is None:
-            logger.error("Category [%s]: Abandoning scrape at page %d.", category_name, page)
             is_success = False
             break
 
-        main_tbl, standalone_tbls, teasers = separate_page_tables(soup)
-        if main_tbl is None:
-            logger.warning(
-                "Category [%s]: No valid price table found on page %d (structure may have changed).",
-                category_name,
-                page,
-            )
-            is_success = False
-            break
+        tables = [t for t in soup.find_all("table") if re.search(r"price", t.get_text(" "), re.I) and len(t.find_all("tr")) > 1]
+        
+        # Determine Main vs Standalone tables
+        main_tbl = next((t for t in tables if UPDATED_RE.search(clean_text(t.get_text(" ")))), None)
+        if main_tbl is None and tables:
+            main_tbl = tables[0]
+
+        # Extract unstructured data if no tables are found at all (Monitors)
+        if not tables:
+            fallback_rows = parse_text_lists(soup)
+            if fallback_rows:
+                for r in fallback_rows:
+                    r.update(sub_list="Bullet-Point Listings", page_last_updated="")
+                category_rows.extend(fallback_rows)
+                break # Bullet lists generally don't paginate
+            else:
+                is_success = False
+                break
 
         main_text = clean_text(main_tbl.get_text(" "))
         last_updated_stamp = parse_timestamp(main_text)
 
-        # Detect total pages on the first page
+        standalone_tbls = []
+        for t in tables:
+            if t is main_tbl: continue
+            teaser_anchor = t.find("a", string=re.compile(r"View full", re.IGNORECASE))
+            if teaser_anchor:
+                label = re.sub(r"(?i)^view full\s*|\s*price list\s*$", "", teaser_anchor.get_text(strip=True))
+                discovered_teasers[urljoin(INDEX_URL, teaser_anchor["href"])] = label
+            else:
+                standalone_tbls.append(t)
+
         if page == 1:
             page_match = re.search(r"Page 1 of (\d+)", main_text, re.IGNORECASE)
-            if page_match:
-                total_pages = int(page_match.group(1))
-            else:
-                logger.info("Category [%s]: Single-page directory detected.", category_name)
-                total_pages = 1
-            discovered_teasers = teasers
+            total_pages = int(page_match.group(1)) if page_match else 1
 
-        # Parse primary table
+        # Parse primary & secondary tables
         main_title = parse_table_title(main_tbl)
-        main_rows = parse_rows_from_table(main_tbl)
-        for row in main_rows:
-            row.update(sub_list=main_title, page_last_updated=last_updated_stamp)
-        category_rows.extend(main_rows)
+        for r in parse_rows_from_table(main_tbl):
+            r.update(sub_list=main_title, page_last_updated=last_updated_stamp)
+            category_rows.append(r)
 
-        # Parse secondary standalone tables on this page (e.g., AMD motherboards)
-        secondary_count = 0
         for st in standalone_tbls:
             sec_title = parse_table_title(st)
-            sec_rows = parse_rows_from_table(st)
-            for row in sec_rows:
-                row.update(sub_list=sec_title, page_last_updated=last_updated_stamp)
-            category_rows.extend(sec_rows)
-            secondary_count += len(sec_rows)
+            for r in parse_rows_from_table(st):
+                r.update(sub_list=sec_title, page_last_updated=last_updated_stamp)
+                category_rows.append(r)
 
-        total_extracted_on_page = len(main_rows) + secondary_count
-        logger.info(
-            "Category [%s]: Parsed page %d/%d -> %d items (Main: %d, Secondary: %d)",
-            category_name,
-            page,
-            total_pages,
-            total_extracted_on_page,
-            len(main_rows),
-            secondary_count,
-        )
-
+        logger.info("Category [%s]: Parsed page %d/%d", category_name, page, total_pages)
         page += 1
         time.sleep(REQUEST_DELAY)
 
-    return category_rows, (is_success and bool(category_rows)), total_pages, discovered_teasers
+    return category_name, category_url, category_rows, (is_success and bool(category_rows)), total_pages, discovered_teasers
 
-
-def write_consolidated_csv(file_path: Path, rows: list[dict]):
-    """Write all collected rows into a single consolidated CSV."""
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(file_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
-    logger.info("Successfully exported %d records to %s", len(rows), file_path)
-
+# --- Output & Execution ---
 
 def output_summary(records: list[dict]):
-    """Emit execution statistics to stdout and write to GITHUB_STEP_SUMMARY if available."""
     metrics.finish()
-
     summary_lines = [
-        "## Nehru Place Scraper Run Report",
-        "",
+        "## Nehru Place Scraper Run Report", "",
         f"- **Execution Time:** {metrics.duration_seconds}s",
         f"- **Total HTTP Requests:** {metrics.total_requests} (Retries: {metrics.retry_count}, Failed: {metrics.failed_requests})",
-        f"- **Total Rows Saved:** {len(records)}",
-        f"- **Pricing Anomalies Detected:** {metrics.anomalies_missing_price} (missing or placeholder prices)",
-        "",
-        "### Category Breakdown",
-        "",
+        f"- **Total Rows Saved:** {len(records)}", "",
+        "### Category Breakdown", "",
         "| Category | Scraped Pages | Total Items | Scrape Status |",
-        "|---|---|---|---|",
+        "|---|---|---|---|"
     ]
 
     for cat_name, stats in metrics.category_breakdown.items():
-        summary_lines.append(
-            f"| {cat_name} | {stats['pages']} | {stats['rows']} | {stats['status']} |"
-        )
+        summary_lines.append(f"| {cat_name} | {stats['pages']} | {stats['rows']} | {stats['status']} |")
 
     summary_markdown = "\n".join(summary_lines)
     logger.info("\n" + summary_markdown)
 
-    # Populate GitHub Actions Step Summary if running in CI
     step_summary_path = os.getenv("GITHUB_STEP_SUMMARY")
     if step_summary_path:
-        try:
-            with open(step_summary_path, "a", encoding="utf-8") as summary_file:
-                summary_file.write(summary_markdown + "\n")
-        except OSError as exc:
-            logger.warning("Could not write to GITHUB_STEP_SUMMARY: %s", exc)
-
+        with open(step_summary_path, "a", encoding="utf-8") as sf:
+            sf.write(summary_markdown + "\n")
 
 def main():
     scrape_all = "--all" in sys.argv
@@ -396,54 +327,58 @@ def main():
     scraped_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     category_queue = extract_category_links(scrape_all)
-    visited_slugs = set()
+    visited_slugs = set(category_queue.keys())
 
-    while category_queue:
-        slug, (label, url) = next(iter(category_queue.items()))
-        del category_queue[slug]
-
-        if slug in visited_slugs:
-            continue
-        visited_slugs.add(slug)
-
-        logger.info(">>> Processing Category: %s (%s)", label, url)
-        rows, is_successful, total_pages, teasers = scrape_category(label, url)
-
-        # Enqueue full lists discovered via teaser links
-        for teaser_url, teaser_label in teasers.items():
-            t_slug = slug_from_url(teaser_url)
-            if t_slug not in visited_slugs and t_slug not in category_queue:
-                logger.info("Discovered sub-category teaser: %s -> Enqueueing.", teaser_label)
-                category_queue[t_slug] = (teaser_label, teaser_url)
-
-        if is_successful:
-            for row in rows:
-                row["category"] = label
-                row["scraped_at_utc"] = scraped_timestamp
-            all_consolidated_rows.extend(rows)
-            metrics.categories_processed += 1
-            status_flag = "Success"
-        else:
-            metrics.categories_failed += 1
-            status_flag = "Failed / Partial"
-            logger.error("Failed to complete scrape for category: %s", label)
-
-        metrics.category_breakdown[label] = {
-            "rows": len(rows),
-            "pages": total_pages,
-            "status": status_flag,
+    # Execute multithreaded scraping
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(scrape_category_worker, label, url): slug
+            for slug, (label, url) in category_queue.items()
         }
 
-    metrics.total_items_parsed = len(all_consolidated_rows)
+        while futures:
+            done, _ = as_completed(futures.keys(), timeout=None), None
+            # Extract first completed future
+            for fut in list(futures.keys()):
+                if fut.done():
+                    slug = futures.pop(fut)
+                    try:
+                        label, url, rows, is_successful, total_pages, teasers = fut.result()
+                        
+                        # Process discovered teaser links (e.g. Internal Hard disk)
+                        for t_url, t_label in teasers.items():
+                            t_slug = slug_from_url(t_url)
+                            if t_slug not in visited_slugs:
+                                visited_slugs.add(t_slug)
+                                logger.info("Discovered sub-category: %s -> Enqueueing.", t_label)
+                                futures[executor.submit(scrape_category_worker, t_label, t_url)] = t_slug
+
+                        if is_successful:
+                            for row in rows:
+                                row["category"] = label
+                                row["scraped_at_utc"] = scraped_timestamp
+                            all_consolidated_rows.extend(rows)
+                            status_flag = "Success"
+                        else:
+                            status_flag = "Failed / Partial"
+                            logger.error("Failed or found no data for category: %s", label)
+
+                        metrics.category_breakdown[label] = {"rows": len(rows), "pages": total_pages, "status": status_flag}
+
+                    except Exception as exc:
+                        logger.error("Fatal error processing category %s: %s", slug, exc)
 
     if not all_consolidated_rows:
-        logger.critical("No rows extracted across any category. Aborting file write.")
-        sys.exit(1)
+        sys.exit("Critical: No rows extracted across any category. Aborting file write.")
 
-    # Overwrite old CSV with today's complete snapshot
-    write_consolidated_csv(OUTPUT_FILE, all_consolidated_rows)
+    # Write output
+    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDS)
+        writer.writeheader()
+        writer.writerows(all_consolidated_rows)
+        
     output_summary(all_consolidated_rows)
-
 
 if __name__ == "__main__":
     main()
