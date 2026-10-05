@@ -1,2 +1,1 @@
-# IndianPCBuilders
-Automated daily scraper and unified CSV dataset for Nehru Place PC hardware prices.
+​A GitHub Actions-powered web scraper that extracts daily PC component prices from Delhi's Nehru Place market. This tool automatically crawls paginated hardware categories, sanitizes the data, and consolidates it into a single, LLM-ready CSV dataset to track market trends and estimate PC build costs.
