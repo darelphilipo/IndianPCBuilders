@@ -10,7 +10,6 @@ import os
 import re
 import sys
 import time
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,7 +25,7 @@ REQUEST_DELAY = 0.5  # Politeness delay between paginated requests
 REQUEST_TIMEOUT = 30 
 MAX_RETRIES = 3
 MAX_WORKERS = 10 # Number of concurrent categories to scrape
-USER_AGENT = "nehru-place-price-scraper/3.0 (open-data dump; github-actions)"
+USER_AGENT = "nehru-place-price-scraper/3.1 (open-data dump; github-actions)"
 
 FIELDS = [
     "category",
@@ -44,6 +43,7 @@ FIELDS = [
 PC_PARTS_SLUGS = {
     "cpu-price-list", "motherboard-price-list", "ram-price-list",
     "graphicscard-price-list", "harddisk-price-list", "cabinet-price-list",
+    "canbet-price-list", # Catches the live site URL typo for cabinets
     "monitor-price-list", "led-lcd-price-list", "keyboard-mouse-price-list",
     "ups-invertor-price-list", "cpu-fan-price", "dvdwriter-price-list",
     "networking-price-list", "multimedia-price-list",
@@ -134,6 +134,10 @@ def extract_category_links(scrape_all: bool) -> dict[str, tuple[str, str]]:
         if not href:
             continue
 
+        # Intercept and correct the known URL typo on the live server
+        if "cabinet-price-list.html" in href:
+            href = href.replace("cabinet-price-list.html", "canbet-price-list.html")
+
         full_url = urljoin(INDEX_URL, href)
         slug = slug_from_url(full_url)
 
@@ -160,7 +164,10 @@ def parse_rows_from_table(table) -> list[dict]:
     rows = []
     last_known_seller = ""
     
-    header_text = clean_text(table.find("tr").get_text(" ")).lower() if table.find("tr") else ""
+    header_text = ""
+    for tr in table.find_all("tr")[:3]:
+        header_text += clean_text(tr.get_text(" ")).lower() + " "
+    
     has_seller_col = "seller" in header_text or "offered by" in header_text
 
     for tr in table.find_all("tr"):
@@ -214,17 +221,22 @@ def parse_rows_from_table(table) -> list[dict]:
     return rows
 
 def parse_text_lists(soup: BeautifulSoup) -> list[dict]:
-    """Fallback parser for unstructured bullet-point layouts (CRT Monitors)."""
+    """Fallback parser for unstructured bullet-point layouts."""
     rows = []
-    for container in soup.find_all(["p", "b", "div"]):
-        for line in container.get_text("\n").split("\n"):
-            line = clean_text(line)
-            # Matches formats like: • Samsung 732n 17″ – 3150/-
-            match = re.search(r"^[•\u2022\-\*]\s*(.*?)\s*(?:–|-)\s*(\d{3,})(?:/-)?$", line)
-            if match:
+    seen = set()
+    for line in soup.get_text("\n").split("\n"):
+        line = clean_text(line)
+        # Matches formats like: • Samsung 732n 17″ – 3150/-
+        match = re.search(r"^[•\u2022\-\*]\s*(.*?)\s*(?:–|-|\u2013|\u2014)\s*(?:Rs\.?\s*)?(\d[\d,]*)(?:/-)?$", line, re.IGNORECASE)
+        if match:
+            model = match.group(1).strip()
+            price = int(re.sub(r"[^\d]", "", match.group(2)))
+            key = (model, price)
+            if key not in seen:
+                seen.add(key)
                 rows.append({
-                    "model": match.group(1).strip(), "specifications": "",
-                    "price_inr": int(match.group(2)), "seller_name": "", "seller_phone": ""
+                    "model": model, "specifications": "",
+                    "price_inr": price, "seller_name": "", "seller_phone": ""
                 })
     return rows
 
@@ -244,24 +256,11 @@ def scrape_category_worker(category_name: str, category_url: str):
 
         tables = [t for t in soup.find_all("table") if re.search(r"price", t.get_text(" "), re.I) and len(t.find_all("tr")) > 1]
         
-        # Determine Main vs Standalone tables
         main_tbl = next((t for t in tables if UPDATED_RE.search(clean_text(t.get_text(" ")))), None)
         if main_tbl is None and tables:
             main_tbl = tables[0]
 
-        # Extract unstructured data if no tables are found at all (Monitors)
-        if not tables:
-            fallback_rows = parse_text_lists(soup)
-            if fallback_rows:
-                for r in fallback_rows:
-                    r.update(sub_list="Bullet-Point Listings", page_last_updated="")
-                category_rows.extend(fallback_rows)
-                break # Bullet lists generally don't paginate
-            else:
-                is_success = False
-                break
-
-        main_text = clean_text(main_tbl.get_text(" "))
+        main_text = clean_text(main_tbl.get_text(" ")) if main_tbl else ""
         last_updated_stamp = parse_timestamp(main_text)
 
         standalone_tbls = []
@@ -278,17 +277,38 @@ def scrape_category_worker(category_name: str, category_url: str):
             page_match = re.search(r"Page 1 of (\d+)", main_text, re.IGNORECASE)
             total_pages = int(page_match.group(1)) if page_match else 1
 
+        extracted_on_page = 0
+
         # Parse primary & secondary tables
-        main_title = parse_table_title(main_tbl)
-        for r in parse_rows_from_table(main_tbl):
-            r.update(sub_list=main_title, page_last_updated=last_updated_stamp)
-            category_rows.append(r)
+        if main_tbl:
+            main_title = parse_table_title(main_tbl)
+            for r in parse_rows_from_table(main_tbl):
+                r.update(sub_list=main_title, page_last_updated=last_updated_stamp)
+                category_rows.append(r)
+                extracted_on_page += 1
 
         for st in standalone_tbls:
             sec_title = parse_table_title(st)
             for r in parse_rows_from_table(st):
                 r.update(sub_list=sec_title, page_last_updated=last_updated_stamp)
                 category_rows.append(r)
+                extracted_on_page += 1
+
+        # Fallback for pages that abandon tables for text bullets
+        if extracted_on_page == 0 and page == 1:
+            fallback_rows = parse_text_lists(soup)
+            if fallback_rows:
+                for r in fallback_rows:
+                    r.update(sub_list="Bullet-Point Listings", page_last_updated=last_updated_stamp)
+                category_rows.extend(fallback_rows)
+                extracted_on_page += len(fallback_rows)
+                is_success = True
+                break # Bullet lists don't paginate
+
+        # Abort if no data was found on page 1 to prevent endless loops on empty schemas
+        if extracted_on_page == 0:
+            is_success = False
+            break
 
         logger.info("Category [%s]: Parsed page %d/%d", category_name, page, total_pages)
         page += 1
@@ -345,7 +365,6 @@ def main():
                     try:
                         label, url, rows, is_successful, total_pages, teasers = fut.result()
                         
-                        # Process discovered teaser links (e.g. Internal Hard disk)
                         for t_url, t_label in teasers.items():
                             t_slug = slug_from_url(t_url)
                             if t_slug not in visited_slugs:
